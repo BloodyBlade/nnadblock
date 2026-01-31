@@ -1,19 +1,18 @@
-#include <sourcemod>
-#include <regex>
-
 #pragma semicolon 1
 #pragma newdecls required
 
+#include <sourcemod>
+#include <regex>
+
 #define PLUGIN_VERSION "0.6"
+#define CVAR_FLAGS FCVAR_NOTIFY
 
 char Logfile[PLATFORM_MAX_PATH];
-Handle g_iTimerList[MAXPLAYERS+1];
-Handle cvar_PluginEnabled = null;
-Handle cvar_PluginMode = null;
-Handle cvar_WarningEnabled = null;
-Handle cvar_WarningMode = null;
+Handle g_iTimerList[MAXPLAYERS + 1] = {null, ...};
+ConVar cvar_PluginEnabled, cvar_PluginMode, cvar_WarningMode;
 Handle g_Regex = null;
-int KickedClients = 0;
+int g_iPluginMode = 0, g_iWarningMode = 0, g_iKickedClients = 0;
+bool bHooked = false;
 
 public Plugin myinfo = 
 {
@@ -26,124 +25,157 @@ public Plugin myinfo =
 
 public void OnPluginStart()
 {
-    cvar_PluginEnabled = CreateConVar("sm_nnadblock_enabled", "1", "1 - Enabled, 0 - Disabled.");
-    cvar_PluginMode = CreateConVar("sm_nnadblock_mode", "1", "1 - checks players every round, 2 - checks players when they connect to the server, 3 - checks players in both situations.");
-    cvar_WarningEnabled = CreateConVar("sm_nnadblock_warning_enabled", "1", "1 - Enabled, kicks users after 5 min, 0 - Disabled, kicks users immediately on round starts.");
-    cvar_WarningMode = CreateConVar("sm_nnadblock_warning_mode", "2", "1 - warning comes in the center of client's screen, 2 - warning comes in chat.");
-    
-    BuildPath(Path_SM, Logfile, sizeof(Logfile), "logs/nnadblock.log");
-    
-    HookEvent("teamplay_round_start", OnRoundStart, EventHookMode_PostNoCopy);
-    
-    RegAdminCmd("sm_kickunallowed", KickUnallowedCommand, ADMFLAG_KICK);
-    RegAdminCmd("sm_kickunallow", KickUnallowedCommand, ADMFLAG_KICK);
-    
-    LoadTranslations("nnadblock.phrases");
-    
-    RegexDomainsName();
+	CreateConVar("l4d2_glow_survivor_version", PLUGIN_VERSION, "[L4D2] Glow Survivor plugin version", CVAR_FLAGS|FCVAR_DONTRECORD);
+	cvar_PluginEnabled = CreateConVar("sm_nnadblock_enabled", "1", "1 - Enabled, 0 - Disabled.", CVAR_FLAGS, true, 0.0, true, 1.0);
+	cvar_PluginMode = CreateConVar("sm_nnadblock_mode", "1", "1 - checks players every round, 2 - checks players when they connect to the server, 3 - checks players in both situations.", CVAR_FLAGS, true, 0.0, true, 3.0);
+	cvar_WarningMode = CreateConVar("sm_nnadblock_warning_mode", "2", "1 - warning comes in the center of client's screen, 2 - warning comes in chat, 0 - Disabled, kicks users immediately on round starts.", CVAR_FLAGS, true, 0.0, true, 2.0);
+
+	AutoExecConfig(true, "sm_nnadblock");
+
+	cvar_PluginEnabled.AddChangeHook(OnConVarEnableChanged);
+	cvar_PluginMode.AddChangeHook(OnConVarsChanged);
+	cvar_WarningMode.AddChangeHook(OnConVarsChanged);
+
+	BuildPath(Path_SM, Logfile, sizeof(Logfile), "logs/nnadblock.log");
+
+	RegAdminCmd("sm_kickunallowed", KickUnallowedCommand, ADMFLAG_KICK);
+	RegAdminCmd("sm_kickunallow", KickUnallowedCommand, ADMFLAG_KICK);
+
+	LoadTranslations("nnadblock.phrases");
+
+	g_Regex = CompileRegex("\\.(ru|net|ua|tf|com|org|su|cash|trade|co|uk)");
 }
 
-public void KickUnallowed(int iClient)
+public void OnConfigsExecuted()
 {
-    if(IsClientInGame(iClient) && !IsFakeClient(iClient))
-    {
-        char szUsername[MAX_NAME_LENGTH];
-        char szUserID[MAX_TARGET_LENGTH];
-        GetClientName(iClient, szUsername, sizeof(szUsername));
-        GetClientAuthId(iClient, AuthId_Steam3, szUserID, sizeof(szUserID));
-        int index = MatchRegex(g_Regex, szUsername);
-        if (index > 0)
-        {
-            KickClient(iClient, "%t", "nnad_kickreason");
-            PrintToChatAll("%s %t", szUsername, "nnad_kickmessage");
-            LogToFile(Logfile, "%s has been kicked due to unallowed nickname! Client id: %s", szUsername, szUserID);
-            KickedClients++;
-        }
-    }
+	IsAllowed();
 }
 
-public Action OnRoundStart(Handle hEvent, const char[] szEventName, bool bDontBroadcast)
+void OnConVarEnableChanged(ConVar cvar, const char[] oldVal, const char[] newVal)
 {
-    if (GetConVarInt(cvar_PluginEnabled) == 1)
-    {
-        KickUnallowedMode1();
-    }
+	IsAllowed();
 }
 
-public void KickUnallowedMode1()
+void OnConVarsChanged(ConVar convar, const char[] oldValue, const char[] newValue)
 {
-    if (GetConVarInt(cvar_PluginMode) == 1 || GetConVarInt(cvar_PluginMode) == 3)
-    {
-        for (int iClientCheck = 1; iClientCheck <= MaxClients; iClientCheck++)
-        {
-            if (GetConVarInt(cvar_WarningEnabled) == 1)
-            {
-                KillTimer(g_iTimerList[iClientCheck]);
-                g_iTimerList[iClientCheck] = null;
-                WarningKick(iClientCheck);
-                g_iTimerList[iClientCheck] = CreateTimer(300.0, KickUnallowedAction, iClientCheck);
-            }
-            else
-            {
-                KickUnallowed(iClientCheck);
-            }
-        }
-    }
+	g_iPluginMode = cvar_PluginMode.IntValue;
+	g_iWarningMode = cvar_WarningMode.IntValue;
 }
 
-public Action KickUnallowedAction(Handle hTimer, any iClientCheck)
+void IsAllowed()
 {
-    KickUnallowed(iClientCheck);
+	bool bPluginOn = cvar_PluginEnabled.BoolValue;
+	if(!bHooked && bPluginOn)
+	{
+		bHooked = true;
+		OnConVarsChanged(null, "", "");
+		HookEvent("teamplay_round_start", OnRoundStart, EventHookMode_PostNoCopy);
+	}
+	else if(bHooked && !bPluginOn)
+	{
+		bHooked = false;
+		UnhookEvent("teamplay_round_start", OnRoundStart, EventHookMode_PostNoCopy);
+		for (int i = 1; i <= MaxClients; i++)
+		{
+			if(g_iTimerList[i] != null)
+			{
+				delete g_iTimerList[i];
+			}
+		}
+	}
 }
 
-public void WarningKick(int client)
+void KickUnallowed(int iClient)
 {
-    if(IsClientInGame(client) && !IsFakeClient(client))
-    {
-        char szUsername[MAX_NAME_LENGTH];
-        GetClientName(client, szUsername, sizeof(szUsername));
-        int index = MatchRegex(g_Regex, szUsername);
-        if (index > 0)
-        {
-            if (GetConVarInt(cvar_WarningMode) == 2)
-            {
-                PrintToChat(client, "[NNAD] %t.", "nnad_warningmessage");
-            }
-            else if (GetConVarInt(cvar_WarningMode) == 1)
-            {
-                SetHudTextParams(-1.0, -1.0, 10.0, 255, 255, 255, 255);
-                ShowHudText(client, -1, "%t!", "nnad_warningmessage");
-            }
-        }
-    }
+	if(iClient > 0 && IsClientInGame(iClient) && !IsFakeClient(iClient))
+	{
+		char szUsername[MAX_NAME_LENGTH], szUserID[MAX_TARGET_LENGTH];
+		GetClientName(iClient, szUsername, sizeof(szUsername));
+		GetClientAuthId(iClient, AuthId_Steam3, szUserID, sizeof(szUserID));
+		if (MatchRegex(g_Regex, szUsername) > 0)
+		{
+			KickClient(iClient, "%t", "nnad_kickreason");
+			PrintToChatAll("%s %t", szUsername, "nnad_kickmessage");
+			LogToFile(Logfile, "%s has been kicked due to unallowed nickname! Client id: %s", szUsername, szUserID);
+			g_iKickedClients++;
+		}
+	}
 }
 
-public Action KickUnallowedCommand(int iClientAdmin, int args) 
+Action OnRoundStart(Event hEvent, const char[] szEventName, bool bDontBroadcast)
 {
-    if(GetConVarInt(cvar_PluginEnabled) == 1)
-    {
-        for (int iClientCheckCommand = 1; iClientCheckCommand <= MaxClients; iClientCheckCommand++)
-        {
-            KickUnallowed(iClientCheckCommand);
-        }
-        PrintToConsole(iClientAdmin, "%i clients has been kicked.", KickedClients);
-        KickedClients = 0;
-    }
-    else
-    {
-        PrintToConsole(iClientAdmin, "Nickname AdBlock is Disabled!");
-    }
+	if (g_iPluginMode == 1 || g_iPluginMode == 3)
+	{
+		for (int iClientCheck = 1; iClientCheck <= MaxClients; iClientCheck++)
+		{
+			if (g_iWarningMode > 0)
+			{
+				if(g_iTimerList[iClientCheck] != null)
+				{
+					delete g_iTimerList[iClientCheck];
+				}
+
+				char szUsername[MAX_NAME_LENGTH];
+				GetClientName(iClientCheck, szUsername, sizeof(szUsername));
+				if (MatchRegex(g_Regex, szUsername) > 0)
+				{
+					if (g_iWarningMode == 1)
+					{
+						SetHudTextParams(-1.0, -1.0, 10.0, 255, 255, 255, 255);
+						ShowHudText(iClientCheck, -1, "%t!", "nnad_warningmessage");
+					}
+					else if (g_iWarningMode == 2)
+					{
+						PrintToChat(iClientCheck, "[NNAD] %t.", "nnad_warningmessage");
+					}
+				}
+
+				g_iTimerList[iClientCheck] = CreateTimer(300.0, KickUnallowedAction, iClientCheck);
+			}
+			else
+			{
+				KickUnallowed(iClientCheck);
+			}
+		}
+	}
+	return Plugin_Continue;
 }
 
 public void OnClientConnected(int iClientCheck)
 {
-    if (GetConVarInt(cvar_PluginMode) == 2 || GetConVarInt(cvar_PluginMode) == 3)
-    {
-        KickUnallowed(iClientCheck);
-    }
+	if (bHooked && (g_iPluginMode == 2 || g_iPluginMode == 3))
+	{
+		KickUnallowed(iClientCheck);
+	}
 }
 
-public void RegexDomainsName()
+Action KickUnallowedAction(Handle hTimer, int iClientCheck)
 {
-    g_Regex = CompileRegex("\\.(ru|net|ua|tf|com|org|su|cash|trade|co|uk)");
+	if(bHooked)
+	{
+		int iClient = GetClientOfUserId(iClientCheck);
+		if(iClient > 0 && IsClientInGame(iClient) && !IsFakeClient(iClient))
+		{
+			KickUnallowed(iClient);
+		}
+	}
+	return Plugin_Stop;
+}
+
+Action KickUnallowedCommand(int iClientAdmin, int args) 
+{
+	if(bHooked)
+	{
+		for (int i = 1; i <= MaxClients; i++)
+		{
+			KickUnallowed(i);
+		}
+		PrintToConsole(iClientAdmin, "%i clients has been kicked.", g_iKickedClients);
+		g_iKickedClients = 0;
+	}
+	else
+	{
+		PrintToConsole(iClientAdmin, "Nickname AdBlock is Disabled!");
+	}
+	return Plugin_Handled;
 }
